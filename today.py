@@ -7,6 +7,7 @@ import os
 from lxml import etree
 import time
 import hashlib
+import re
 
 # Fine-grained personal access token with All Repositories access:
 # Account permissions: read:Followers, read:Starring, read:Watching
@@ -14,7 +15,23 @@ import hashlib
 # Issues and pull requests permissions not needed at the moment, but may be used in the future
 HEADERS = {'authorization': 'token '+ os.environ['ACCESS_TOKEN']}
 USER_NAME = os.environ['USER_NAME'] # 'Andrew6rant'
-QUERY_COUNT = {'user_getter': 0, 'follower_getter': 0, 'graph_repos_stars': 0, 'recursive_loc': 0, 'graph_commits': 0, 'loc_query': 0}
+QUERY_COUNT = {'user_getter': 0, 'follower_getter': 0, 'graph_repos_stars': 0, 'recursive_loc': 0, 'graph_commits': 0, 'loc_query': 0, 'commit_files': 0}
+
+# Files that aren't written by hand: lockfiles, build output, vendored or minified code,
+# images, fonts and media. Their lines are left out of the LOC count.
+GENERATED_FILES = re.compile(r'''
+    (^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|composer\.lock|
+          Cargo\.lock|Gemfile\.lock|poetry\.lock|uv\.lock|Podfile\.lock|Package\.resolved)$
+  | (^|/)(node_modules|vendor|dist|build|out|\.next|\.nuxt|\.svelte-kit|coverage|\.vercel|DerivedData)/
+  | \.(min\.js|min\.css|map|svg|png|jpe?g|gif|webp|avif|ico|icns|ttf|otf|woff2?|eot|mp3|mp4|mov|webm|wav|pdf|zip|csv|geojson|obj|glb|gltf|fbx|stl|usdz|hdr|exr)$
+''', re.IGNORECASE | re.VERBOSE)
+
+# Repositories left out of the LOC and commit counts: copies of other repos and
+# code I didn't write (tutorial templates).
+EXCLUDED_REPOS = {
+    'constPaolo/personalNOTHUS',               # single-commit copy of constPaolo/nothus
+    'constPaolo/codegrid-poly-app-photo-dump', # CodeGrid tutorial template
+}
 
 
 def daily_readme(birthday):
@@ -123,6 +140,7 @@ def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, delet
                                 node {
                                     ... on Commit {
                                         committedDate
+                                        oid
                                     }
                                     author {
                                         user {
@@ -163,12 +181,36 @@ def loc_counter_one_repo(owner, repo_name, data, cache_comment, history, additio
     for node in history['edges']:
         if node['node']['author']['user'] == OWNER_ID:
             my_commits += 1
-            addition_total += node['node']['additions']
-            deletion_total += node['node']['deletions']
+            added, deleted = handwritten_lines(owner, repo_name, node['node']['oid'])
+            addition_total += added
+            deletion_total += deleted
 
     if history['edges'] == [] or not history['pageInfo']['hasNextPage']:
         return addition_total, deletion_total, my_commits
     else: return recursive_loc(owner, repo_name, data, cache_comment, addition_total, deletion_total, my_commits, history['pageInfo']['endCursor'])
+
+
+def handwritten_lines(owner, repo_name, oid):
+    """
+    Lines added and deleted by one commit, file by file, leaving out GENERATED_FILES.
+    GraphQL only gives a commit's total, so this asks the REST API for its file list.
+    """
+    added = deleted = 0
+    page = 1
+    while True:
+        query_count('commit_files')
+        request = requests.get(f'https://api.github.com/repos/{owner}/{repo_name}/commits/{oid}',
+                               params={'per_page': 100, 'page': page}, headers=HEADERS)
+        if request.status_code != 200:
+            raise Exception('handwritten_lines() has failed with a', request.status_code, request.text, QUERY_COUNT)
+        files = request.json().get('files', [])
+        for file in files:
+            if not GENERATED_FILES.search(file['filename']):
+                added += file['additions']
+                deleted += file['deletions']
+        if len(files) < 100:
+            return added, deleted
+        page += 1
 
 
 def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None, edges=[]):
@@ -242,6 +284,9 @@ def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0):
     data = data[comment_size:] # remove those lines
     for index in range(len(edges)):
         repo_hash, commit_count, *__ = data[index].split()
+        if edges[index]['node']['nameWithOwner'] in EXCLUDED_REPOS:
+            data[index] = repo_hash + ' 0 0 0 0\n'
+            continue
         if repo_hash == hashlib.sha256(edges[index]['node']['nameWithOwner'].encode('utf-8')).hexdigest():
             try:
                 if int(commit_count) != edges[index]['node']['defaultBranchRef']['target']['history']['totalCount']:
